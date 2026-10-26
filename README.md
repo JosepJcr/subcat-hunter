@@ -77,7 +77,7 @@ Clone the repository and set execution permissions:
 ```bash
 git clone https://github.com/your-username/subcat-hunter
 cd subcat-hunter
-chmod +x passive_login_finder.py
+chmod +x subcat-hunter.py
 ```
 
 ---
@@ -87,7 +87,7 @@ chmod +x passive_login_finder.py
 Run the script interactively:
 
 ```bash
-python3 passive_login_finder.py
+python3 subcat-hunter.py
 ```
 
 ### Workflow
@@ -168,4 +168,3 @@ This software is intended for authorized security auditing, defensive asset mana
 ## License
 
 MIT License. See `LICENSE` for details.
-
