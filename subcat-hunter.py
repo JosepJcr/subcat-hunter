@@ -12,10 +12,13 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import string
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -733,6 +736,107 @@ def run_active_resolution(candidates: Iterable[str], domain: str, resolvers: Lis
     return found
 
 
+def check_dnsx_installed() -> bool:
+    """Comprueba si el binario externo dnsx (ProjectDiscovery) esta en el PATH."""
+    return shutil.which("dnsx") is not None
+
+
+def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[str],
+                        threads: int, label: str) -> Dict[str, Dict[str, List[str]]]:
+    """Resuelve candidatos usando el motor externo dnsx (ProjectDiscovery) en lugar del
+    resolver UDP interno. Usa el filtro de wildcard nativo de dnsx (-wd) y JSON streaming.
+    Si dnsx no esta disponible, recae automaticamente en el resolver interno (dns_resolve)."""
+    cands = sorted(set(candidates))
+    total = len(cands)
+    found: Dict[str, Dict[str, List[str]]] = {}
+    if not total:
+        print(f"{YELLOW}[i] {label}: no hay candidatos que probar.{RESET}")
+        return found
+
+    if not check_dnsx_installed():
+        print(f"{RED}[-] dnsx no esta instalado o no esta en el PATH.{RESET}")
+        print(f"{YELLOW}[i] Instalacion: go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest{RESET}")
+        print(f"{YELLOW}[i] Se usara el resolver interno (fallback) para esta tanda.{RESET}")
+        return run_active_resolution(cands, domain, resolvers, threads, label)
+
+    print(f"\n{YELLOW}[*] {label}: probando {total} candidatos con {BOLD}dnsx{RESET}{YELLOW} "
+          f"({threads} hilos)...{RESET}")
+
+    wild = WildcardDetector(resolvers)
+    w_ips, w_cnames = wild.profile(domain)
+    if w_ips or w_cnames:
+        print(f"{YELLOW}[!] Wildcard DNS detectado en {domain}: dnsx filtrara respuestas "
+              f"identicas al wildcard (-wd).{RESET}")
+
+    tmp_path = None
+    proc = None
+    start = time.time()
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                         encoding="utf-8") as tf:
+            tf.write("\n".join(cands))
+            tmp_path = tf.name
+
+        cmd = [
+            "dnsx",
+            "-silent",
+            "-l", tmp_path,
+            "-r", ",".join(resolvers),
+            "-t", str(threads),
+            "-a", "-cname", "-resp",
+            "-wd", domain,
+            "-json",
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, bufsize=1)
+        done = 0
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = rec.get("host", "").rstrip(".")
+            if not name:
+                continue
+            ips = [ip for ip in rec.get("a", []) if ip]
+            cnames = [c.rstrip(".") for c in rec.get("cname", []) if c]
+            if not ips and not cnames:
+                continue
+            found[name] = {"ips": ips, "cnames": cnames}
+            done += 1
+            sys.stdout.write("\r" + " " * 78 + "\r")
+            print(format_hit(name, ips, cnames))
+            if done % 50 == 0:
+                rate = done / max(time.time() - start, 0.001)
+                sys.stdout.write(f"\r  progreso: {done} hallazgos ({rate:.0f} q/s)   ")
+                sys.stdout.flush()
+        proc.wait()
+    except FileNotFoundError:
+        print(f"{RED}[-] No se pudo ejecutar dnsx (binario no encontrado al lanzar el proceso).{RESET}")
+        return run_active_resolution(cands, domain, resolvers, threads, label)
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}[!] Interrumpido por el usuario; se conservan los resultados parciales.{RESET}")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    elapsed = round(time.time() - start, 1)
+    print(f"\n{CYAN}[OK] {label} (dnsx) terminado en {elapsed}s | hallazgos: {BOLD}{len(found)}{RESET}")
+    return found
+
+
 def _ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
     raw = input(f"{BOLD}{prompt} [{default}]: {RESET}").strip()
     if not raw:
@@ -747,13 +851,19 @@ def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[st
     """Menu interactivo de enumeracion activa. Devuelve {subdominio: {ips, cnames}}."""
     print(f"\n{MAGENTA}============================================================{RESET}")
     print(f" {BOLD}ENUMERACION ACTIVA: diccionario + permutaciones + fuzzing ({domain}){RESET}")
-    print(f" {YELLOW}Envia consultas DNS directas a los resolvers; NO es trafico pasivo.{RESET}")
+    print(f" {YELLOW}Motor de resolucion: {BOLD}dnsx{RESET}{YELLOW} (ProjectDiscovery). "
+          f"Envia consultas DNS directas; NO es trafico pasivo.{RESET}")
     print(f"{MAGENTA}============================================================{RESET}")
 
     print(f"\n{RED}{BOLD}[ AVISO ]{RESET} {RED}Esta seccion es ACTIVA: genera trafico DNS real y masivo "
           f"hacia los resolvers y el dominio objetivo.{RESET}")
     print(f"{RED}          Usala solo sobre dominios propios o con autorizacion expresa. "
           f"El uso es responsabilidad del auditor.{RESET}")
+
+    if not check_dnsx_installed():
+        print(f"\n{YELLOW}[!] Aviso: no se detecta el binario 'dnsx' en el PATH. Se usara el "
+              f"resolver interno como fallback automatico en cada tanda.{RESET}")
+        print(f"{YELLOW}    Instalacion: go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest{RESET}")
 
     print(f"\n {BOLD}1.{RESET} Diccionario (bruteforce de subdominios)")
     print(f" {BOLD}2.{RESET} Permutaciones (sobre subdominios conocidos / hallados)")
@@ -795,7 +905,7 @@ def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[st
 
     if do_dict:
         cands = dictionary_candidates(domain, words) - known
-        hits = run_active_resolution(cands, domain, resolvers, threads, "Diccionario")
+        hits = run_dnsx_resolution(cands, domain, resolvers, threads, "Diccionario")
         results.update(hits)
         seeds |= set(hits)
 
@@ -810,7 +920,7 @@ def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[st
                 cap = _ask_int("Maximo de permutaciones a probar (las mas cortas primero)",
                                min(len(perms), 100000), 1, len(perms))
                 chosen = sorted(perms, key=lambda x: (len(x), x))[:cap]
-                hits = run_active_resolution(chosen, domain, resolvers, threads, "Permutaciones")
+                hits = run_dnsx_resolution(chosen, domain, resolvers, threads, "Permutaciones")
                 results.update(hits)
 
     if do_fuzz:
@@ -820,7 +930,7 @@ def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[st
         if template:
             cands = expand_fuzz_template(template, domain, words) - known - set(results)
             if cands:
-                hits = run_active_resolution(cands, domain, resolvers, threads, "Fuzzing")
+                hits = run_dnsx_resolution(cands, domain, resolvers, threads, "Fuzzing")
                 results.update(hits)
             else:
                 print(f"{YELLOW}[!] La plantilla no genero candidatos validos (usa FUZZ y/o NUM).{RESET}")
