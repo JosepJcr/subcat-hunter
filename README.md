@@ -2,12 +2,12 @@
 
 ```text
        /\_/\  
-      ( o.o )   S U B C A T   H U N T E R :: Passive Login Hunter & Deep Dig
-       > ^ <    [ Multi-Engine OSINT | Deep Dig | Zero-Traffic Target ]
+      ( o.o )   S U B C A T   H U N T E R :: Passive Login Hunter & Deep Dig v3.0
+       > ^ <    [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum (dnsx) ]
       (_|_|_)   
 ```
 
-An automated, interactive wrapper and passive reconnaissance interface designed to discover hidden administrative interfaces, single sign-on (SSO) portals, staging environments, and corporate logins without sending a single packet to the target organization.
+An automated, interactive wrapper and reconnaissance interface designed to discover hidden administrative interfaces, single sign-on (SSO) portals, staging environments, and corporate logins. Its core workflow is passive (zero packets to the target), with an optional, clearly-labeled **active enumeration** mode for dictionary, permutation, and fuzzing-based discovery when you have authorization to query the target directly.
 
 ---
 
@@ -25,16 +25,18 @@ All credit for the original Subcat tool and its passive data collection concepts
 
 ---
 
-## Zero-Traffic Philosophy
+## Zero-Traffic Philosophy (Passive Mode)
 
-Unlike active scanners that flood target systems with HTTP requests or DNS brute-force queries, SubCat Hunter operates on a strict **zero-contact model**:
+By default, options 1-5 of SubCat Hunter operate on a strict **zero-contact model**:
 
 1. **No direct HTTP/HTTPS connections** to the target domain or its IP infrastructure.
 2. **No direct DNS queries** to the target's authoritative nameservers.
 3. **Public data only**: All intelligence is gathered by querying public Certificate Transparency (CT) logs, historical web search caches, and public passive DNS databases.
 4. **Cloudflare DNS-over-HTTPS (DoH)**: All DNS and deep infrastructure queries are routed securely through Cloudflare's public resolver (`1.1.1.1`), ensuring zero interaction with the target's network.
 
-This makes SubCat Hunter safe for Attack Surface Management (ASM), shadow IT auditing, external risk assessments, and defensive perimeter evaluations.
+This makes passive mode safe for Attack Surface Management (ASM), shadow IT auditing, external risk assessments, and defensive perimeter evaluations.
+
+> **Note**: Option `6` (Active Enumeration) is the one exception to this model — see below. It is opt-in, clearly labeled, and requires explicit confirmation of scope before it runs.
 
 ---
 
@@ -58,6 +60,13 @@ This makes SubCat Hunter safe for Attack Surface Management (ASM), shadow IT aud
   - If a user inputs a subdomain (e.g., `stats.example.com`), the tool detects the apex domain (`example.com`) and offers to scan the entire organization or limit scope to the specific host.
 - **Cloud Provider Resolution**:
   - Resolves CNAME and A records of flagged login portals to identify underlying cloud providers (Okta, AWS CloudFront, Akamai Edge, Azure Traffic Manager, Cloudflare).
+- **Active Enumeration (opt-in, option `6`)**:
+  - **Dictionary**: brute-forces subdomains against a large built-in wordlist (500+ entries) or your own custom wordlist file.
+  - **Permutations**: altdns-style mutation of already-discovered subdomains (label insertion, prefix/suffix, numeric variations, environment-token swaps like `dev` ↔ `prod`).
+  - **Fuzzing**: template-based expansion using `FUZZ` (dictionary words) and `NUM` (0-99) placeholders, e.g. `api-FUZZ`, `app-NUM`.
+  - **Resolution engine**: queries are resolved via the external [`dnsx`](https://github.com/projectdiscovery/dnsx) tool (ProjectDiscovery) when available, with its native wildcard filter (`-wd`) applied automatically. If `dnsx` is not installed, the tool transparently falls back to its own pure-Python DNS resolver.
+  - **Wildcard detection**: profiles each zone with randomized lookups to filter out wildcard DNS false positives before reporting a hit.
+  - Requires an explicit on-screen acknowledgment that this mode sends real, direct DNS traffic to the target before it runs.
 - **Dynamic Session Awareness**:
   - Adapts greetings and report authorship to the active system user.
 
@@ -66,7 +75,12 @@ This makes SubCat Hunter safe for Attack Surface Management (ASM), shadow IT aud
 ## Prerequisites
 
 - **Python 3.8+**
-- No external Python dependencies required (pure standard library).
+- No external Python dependencies required for passive mode (pure standard library).
+- **Optional** — for Active Enumeration (option `6`): [`dnsx`](https://github.com/projectdiscovery/dnsx) in your `PATH`.
+  ```bash
+  go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+  ```
+  Without it, option `6` still works, using the built-in fallback resolver instead.
 
 ---
 
@@ -100,7 +114,8 @@ python3 subcat-hunter.py
    - `3`: Full Scan + Deep Dig (Execute both concurrently).
    - `4`: Resolve CNAME/IP (Map candidate logins to cloud providers).
    - `5`: View / Add custom keywords.
-   - `6`: Exit.
+   - `6`: **Active Enumeration** (dictionary + permutations + fuzzing, resolved via `dnsx`). Sends real DNS traffic — use only on domains you own or are authorized to test.
+   - `7`: Exit.
 4. **Report Export**: Choose whether to save the consolidated report to `<domain>_subcat_report.txt`.
 
 ---
@@ -109,9 +124,9 @@ python3 subcat-hunter.py
 
 ```text
        /\_/\  
-      ( o.o )   S U B C A T   H U N T E R :: Passive Login Hunter & Deep Dig v2.5
+      ( o.o )   S U B C A T :: Passive Login Hunter & Deep Dig v3.0
        > ^ <    >> Hello, auditor! Passive reconnaissance & deep audit <<
-      (_|_|_)   [ Multi-Engine OSINT | Deep Dig | Zero-Traffic Target ]
+      (_|_|_)   [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum (dnsx) ]
 
   [+] Hello, auditor! Session initialized. Ready to audit.
 
@@ -123,9 +138,10 @@ Introduce el dominio a analizar: example.com
  3. Escaneo Completo + Dig Profundo (Busqueda + Auditoria total)
  4. Resolver CNAME e IPs de los logins encontrados (Descubrir Okta, AWS, etc.)
  5. Ver / Anadir palabras clave de filtrado
- 6. Salir
+ 6. Enumeracion ACTIVA (Diccionario + Permutaciones + Fuzzing)
+ 7. Salir
 
-Selecciona una opcion (1-6): 1
+Selecciona una opcion (1-7): 1
 
 [*] Iniciando consultas pasivas en paralelo (Zero-Traffic)...
   [+] URLScan      :  13 subdominios
