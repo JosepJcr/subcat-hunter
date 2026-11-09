@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-SubCat - Passive Login Hunter & Deep Dig v2.5
-Reconocimiento pasivo multi-fuente en paralelo y auditoria DNS profunda (Zero-Traffic).
+SubCat - Passive Login Hunter & Deep Dig + Active Enum v3.0
+Reconocimiento pasivo multi-fuente, auditoria DNS profunda y enumeracion ACTIVA
+(diccionario, permutaciones y fuzzing con deteccion de wildcard).
 Fuentes: RapidDNS, CertSpotter, HackerTarget, URLScan, crt.sh, AlienVault OTX + Deep DoH/Dig.
 """
 
 import concurrent.futures
+import ipaddress
 import json
 import os
+import random
 import re
+import socket
+import string
+import struct
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Iterable, List, Set, Tuple
 
 # Colores ANSI para la terminal
 CYAN = "\033[96m"
@@ -41,9 +48,9 @@ def get_banner(username: str) -> str:
     """Genera la cabecera estilizada con saludo adaptado al usuario (sin emojis)."""
     return f"""{CYAN}
        /\\_/\\  
-      ( {MAGENTA}o.o{CYAN} )   {BOLD}{MAGENTA}S U B C A T{RESET}{CYAN} :: {YELLOW}Passive Login Hunter & Deep Dig v2.5{RESET}
+      ( {MAGENTA}o.o{CYAN} )   {BOLD}{MAGENTA}S U B C A T{RESET}{CYAN} :: {YELLOW}Passive Login Hunter & Deep Dig v3.0{RESET}
       {CYAN} > {MAGENTA}^{CYAN} <    {GREEN}>> Hello, {BOLD}{MAGENTA}{username}{RESET}{GREEN}! Passive reconnaissance & deep audit <<{RESET}
-      {CYAN}(_|_|_)   {BOLD}[ Multi-Engine OSINT | Deep Dig | Zero-Traffic Target ]{RESET}
+      {CYAN}(_|_|_)   {BOLD}[ Multi-Engine OSINT | Deep Dig | Passive + Active Enum ]{RESET}
 """
 
 # Palabras clave ampliadas para identificar portales, logins, accesos y entornos sensibles
@@ -339,6 +346,489 @@ def resolve_candidate_logins(candidates: List[Tuple[str, str]]):
         print(f"  {RED}[*]{RESET} {BOLD}{sub:<35}{RESET} [{tag}]: {status_str}")
 
 
+# --- Enumeracion ACTIVA: diccionario, permutaciones y fuzzing (DNS directo) ---
+
+DEFAULT_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"]
+DNS_TIMEOUT = 2.5
+
+BUILTIN_WORDLIST = """
+www mail remote blog webmail server ns ns1 ns2 ns3 smtp secure vpn m shop ftp mail2 test portal
+dev host support dev1 dev2 web web1 web2 admin mx mx1 mx2 cdn api exchange app apps gateway gw
+mobile static media assets img images beta stage staging stage2 prod production qa uat demo
+sandbox preprod pre-prod stg int internal intranet extranet corp corporate office login sso auth
+oauth idp saml adfs identity accounts account id signin signup register panel cpanel whm plesk
+dashboard console manage manager management control controlpanel backoffice back-office bo crm
+erp hr helpdesk help tickets ticket jira confluence wiki docs doc kb git gitlab github bitbucket
+svn repo repos code ci cd jenkins build bamboo teamcity sonar sonarqube nexus artifactory
+registry docker harbor k8s kube kubernetes rancher argo argocd grafana kibana elk elastic
+elasticsearch logstash splunk prometheus alertmanager zabbix nagios monitor monitoring status
+metrics graphite influx vault consul nomad terraform ansible puppet chef salt db database mysql
+mariadb postgres postgresql pgsql mongo mongodb redis memcached rabbitmq kafka mq queue sql mssql
+oracle phpmyadmin pma adminer files file upload uploads download downloads share sharing storage
+s3 bucket backup backups bak old new legacy archive tmp temp test1 test2 testing api2 api-dev
+api-test api-stage v1 v2 v3 rest graphql ws websocket socket sip voip pbx webrtc meet chat im
+conference zoom video stream live cam owa autodiscover lyncdiscover dialin sftp ssh rdp vnc
+bastion jump jumpbox proxy proxy1 lb lb1 haproxy nginx apache tomcat origin edge cache varnish
+waf firewall fw router sw switch nas san vmware vcenter esxi proxmox ilo idrac ipmi printer scan
+cloud aws azure gcp okta ping pingfederate keycloak ldap ad dc dc1 dc2 radius mdm intune
+endpoint soc siem sentry pay payment payments checkout billing invoice store cart orders order
+catalog search solr data datalake bi analytics tableau powerbi report reports reporting lab labs
+research training learn lms moodle students student partners partner vendor vendors supplier
+suppliers client clients customer customers b2b b2c newsletter email mailer mta relay mailgw
+imap pop pop3 es en fr de it pt us uk eu asia
+""".split()
+
+PERM_WORDS = [
+    "dev", "test", "qa", "uat", "stage", "staging", "stg", "prod", "prd", "preprod", "demo",
+    "beta", "sandbox", "int", "internal", "old", "new", "bak", "backup", "tmp", "admin", "api",
+    "v1", "v2", "web", "app", "corp", "private", "secure", "cdn", "mgmt", "vpn", "auth",
+]
+
+ENV_TOKENS = [
+    "dev", "test", "qa", "uat", "stage", "staging", "stg", "prod", "prd",
+    "preprod", "demo", "beta", "sandbox", "int", "internal",
+]
+
+# (subcadena en el CNAME, etiqueta, color). Incluye proveedores propensos a subdomain takeover.
+CLOUD_SIGNATURES = [
+    ("okta", "OKTA SSO", RED), ("cloudfront", "AWS CloudFront", YELLOW),
+    ("amazonaws", "AWS", YELLOW), ("azurewebsites", "Azure App Service", CYAN),
+    ("trafficmanager", "Azure", CYAN), ("azure", "Azure", CYAN),
+    ("cloudflare", "Cloudflare", YELLOW), ("akamai", "Akamai", MAGENTA),
+    ("edgekey", "Akamai", MAGENTA), ("github.io", "GitHub Pages", MAGENTA),
+    ("herokuapp", "Heroku", MAGENTA), ("netlify", "Netlify", MAGENTA),
+    ("vercel", "Vercel", MAGENTA), ("fastly", "Fastly", MAGENTA),
+    ("zendesk", "Zendesk", MAGENTA), ("shopify", "Shopify", MAGENTA),
+]
+
+_LABEL_RE = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$")
+
+
+def is_valid_host(name: str) -> bool:
+    """Valida longitud y caracteres de cada etiqueta DNS."""
+    if not name or len(name) > 253:
+        return False
+    return all(_LABEL_RE.match(label) for label in name.split("."))
+
+
+def cloud_tag(cname: str) -> str:
+    c = cname.lower()
+    for needle, label, color in CLOUD_SIGNATURES:
+        if needle in c:
+            return f" {color}[{label}]{RESET}"
+    return ""
+
+
+# --- Cliente DNS UDP minimo (solo stdlib) ---
+
+def _encode_qname(name: str) -> bytes:
+    out = b""
+    for label in name.rstrip(".").split("."):
+        raw = label.encode("ascii")
+        if not 0 < len(raw) < 64:
+            raise ValueError("etiqueta invalida")
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _read_name(data: bytes, off: int) -> Tuple[str, int]:
+    """Lee un nombre DNS (con compresion por punteros). Devuelve (nombre, offset siguiente)."""
+    labels: List[str] = []
+    next_off = None
+    hops = 0
+    while True:
+        length = data[off]
+        if length == 0:
+            off += 1
+            break
+        if length & 0xC0 == 0xC0:
+            if next_off is None:
+                next_off = off + 2
+            off = ((length & 0x3F) << 8) | data[off + 1]
+            hops += 1
+            if hops > 20:
+                raise ValueError("bucle de compresion")
+            continue
+        off += 1
+        labels.append(data[off:off + length].decode("ascii", errors="ignore"))
+        off += length
+    return ".".join(labels), (next_off if next_off is not None else off)
+
+
+def _parse_response(data: bytes, tid: int) -> Tuple[str, List[str], List[str]]:
+    rid, flags, qd, an, _, _ = struct.unpack(">HHHHHH", data[:12])
+    if rid != tid or not flags & 0x8000:
+        raise ValueError("respuesta no valida")
+    rcode = flags & 0xF
+    off = 12
+    for _ in range(qd):
+        _, off = _read_name(data, off)
+        off += 4
+    ips: List[str] = []
+    cnames: List[str] = []
+    for _ in range(an):
+        _, off = _read_name(data, off)
+        rtype, _, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        if rtype == 1 and rdlen == 4:
+            ips.append(".".join(str(b) for b in data[off:off + 4]))
+        elif rtype == 5:
+            target, _ = _read_name(data, off)
+            cnames.append(target.lower())
+        off += rdlen
+    if ips or cnames:
+        return "ok", ips, cnames
+    if rcode == 3:
+        return "nxdomain", [], []
+    if rcode == 0:
+        return "nodata", [], []
+    return "fail", [], []
+
+
+def dns_resolve(name: str, resolvers: List[str], timeout: float = DNS_TIMEOUT,
+                retries: int = 2) -> Tuple[str, List[str], List[str]]:
+    """Consulta A directa por UDP. Devuelve (estado, ips, cnames).
+    Estados: ok | nxdomain | nodata | fail. Un CNAME sin IP cuenta como 'ok' (util para takeovers)."""
+    try:
+        qname = _encode_qname(name)
+    except (UnicodeEncodeError, ValueError):
+        return "fail", [], []
+
+    for _ in range(retries + 1):
+        resolver = random.choice(resolvers)
+        tid = random.randint(0, 0xFFFF)
+        packet = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(packet, (resolver, 53))
+            data, _ = sock.recvfrom(4096)
+        except OSError:  # incluye socket.timeout
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+        try:
+            result = _parse_response(data, tid)
+        except (ValueError, IndexError, struct.error):
+            continue
+        if result[0] == "fail":
+            continue
+        return result
+    return "fail", [], []
+
+
+class WildcardDetector:
+    """Detecta wildcard DNS por zona (apex o subzona) y filtra falsos positivos."""
+
+    def __init__(self, resolvers: List[str], timeout: float = DNS_TIMEOUT):
+        self.resolvers = resolvers
+        self.timeout = timeout
+        self._cache: Dict[str, Tuple[Set[str], Set[str]]] = {}
+        self._lock = threading.Lock()
+
+    def profile(self, zone: str) -> Tuple[Set[str], Set[str]]:
+        with self._lock:
+            if zone in self._cache:
+                return self._cache[zone]
+        ips: Set[str] = set()
+        cnames: Set[str] = set()
+        for _ in range(3):
+            rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=14))
+            status, i, c = dns_resolve(f"{rnd}.{zone}", self.resolvers, self.timeout)
+            if status == "ok":
+                ips.update(i)
+                cnames.update(c)
+        with self._lock:
+            self._cache[zone] = (ips, cnames)
+        return ips, cnames
+
+    def is_wildcard(self, name: str, ips: List[str], cnames: List[str]) -> bool:
+        zone = name.split(".", 1)[1] if "." in name else name
+        w_ips, w_cnames = self.profile(zone)
+        if not w_ips and not w_cnames:
+            return False
+        if cnames and w_cnames:
+            return set(cnames) <= w_cnames
+        if not cnames and ips and w_ips and not w_cnames:
+            return set(ips) <= w_ips
+        return False
+
+
+# --- Generadores de candidatos ---
+
+def load_wordlist(path: str) -> List[str]:
+    words: List[str] = []
+    seen: Set[str] = set()
+    try:
+        with open(os.path.expanduser(path.strip().strip('"').strip("'")), "r",
+                  encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                w = line.strip().lower()
+                if not w or w.startswith("#") or w in seen:
+                    continue
+                seen.add(w)
+                words.append(w)
+    except OSError as e:
+        print(f"{RED}[-] No se pudo leer el diccionario: {e}{RESET}")
+        return []
+    return words
+
+
+def dictionary_candidates(domain: str, words: Iterable[str]) -> Set[str]:
+    cands = {f"{w}.{domain}" for w in words}
+    return {c for c in cands if is_valid_host(c)}
+
+
+def generate_permutations(seeds: Iterable[str], domain: str,
+                          words: List[str] = None) -> Set[str]:
+    """Permutaciones estilo altdns sobre subdominios conocidos:
+    insercion de etiquetas, prefijo/sufijo con y sin guion, variaciones numericas
+    e intercambio de tokens de entorno (dev <-> prod, etc.)."""
+    words = words or PERM_WORDS
+    suffix = "." + domain
+    seed_set = set(seeds)
+    out: Set[str] = set()
+
+    for sub in seed_set:
+        if not sub.endswith(suffix):
+            continue
+        labels = sub[:-len(suffix)].split(".")
+
+        # 1) insertar una etiqueta nueva en cada posicion
+        for i in range(len(labels) + 1):
+            for w in words:
+                out.add(".".join(labels[:i] + [w] + labels[i:]))
+
+        for i, lab in enumerate(labels):
+            head, tail = labels[:i], labels[i + 1:]
+
+            def put(new_label: str):
+                out.add(".".join(head + [new_label] + tail))
+
+            # 2) prefijo / sufijo
+            for w in words:
+                put(f"{w}-{lab}")
+                put(f"{lab}-{w}")
+                put(f"{w}{lab}")
+                put(f"{lab}{w}")
+
+            # 3) variaciones numericas
+            m = re.search(r"(\d+)$", lab)
+            if m:
+                base, num, width = lab[:m.start()], int(m.group(1)), len(m.group(1))
+                for n in range(max(0, num - 3), num + 4):
+                    put(f"{base}{str(n).zfill(width)}")
+            else:
+                for n in range(1, 4):
+                    put(f"{lab}{n}")
+                    put(f"{lab}-{n}")
+                    put(f"{lab}0{n}")
+
+            # 4) intercambio de tokens de entorno
+            parts = lab.split("-")
+            for idx, p in enumerate(parts):
+                if p in ENV_TOKENS:
+                    for env in ENV_TOKENS:
+                        if env != p:
+                            put("-".join(parts[:idx] + [env] + parts[idx + 1:]))
+
+    result = {c + suffix for c in out}
+    result = {c for c in result if is_valid_host(c) and c not in seed_set}
+    return result
+
+
+def expand_fuzz_template(template: str, domain: str, words: Iterable[str]) -> Set[str]:
+    """Expande plantillas con FUZZ (palabras del diccionario) y NUM (0-99 y 00-09).
+    Ejemplos: api-FUZZ | FUZZ.dev | app-NUM | FUZZ-NUM.internal"""
+    template = template.strip()
+    if "FUZZ" not in template and "NUM" not in template:
+        return set()
+    if not template.lower().endswith("." + domain):
+        template = f"{template.rstrip('.')}.{domain}"
+
+    variants = {template}
+    if "FUZZ" in template:
+        word_list = list(words)
+        variants = {v.replace("FUZZ", w) for v in variants for w in word_list}
+    if "NUM" in template:
+        nums = [str(n) for n in range(100)] + [f"{n:02d}" for n in range(10)]
+        variants = {v.replace("NUM", n) for v in variants for n in nums}
+    return {v.lower() for v in variants if is_valid_host(v.lower())}
+
+
+# --- Motor de resolucion concurrente ---
+
+def format_hit(name: str, ips: List[str], cnames: List[str]) -> str:
+    parts = []
+    if cnames:
+        chain = " > ".join(cnames)
+        parts.append(f"CNAME -> {chain}{cloud_tag(cnames[-1])}")
+    if ips:
+        parts.append(f"IP -> {', '.join(ips[:2])}")
+    elif cnames:
+        parts.append(f"{RED}[CNAME sin IP: revisar dangling / takeover]{RESET}")
+    return f"  {GREEN}[+]{RESET} {BOLD}{name:<42}{RESET} {' | '.join(parts)}"
+
+
+def run_active_resolution(candidates: Iterable[str], domain: str, resolvers: List[str],
+                          threads: int, label: str) -> Dict[str, Dict[str, List[str]]]:
+    """Resuelve candidatos en paralelo, filtra wildcards y muestra hallazgos en vivo."""
+    cands = sorted(set(candidates))
+    total = len(cands)
+    found: Dict[str, Dict[str, List[str]]] = {}
+    if not total:
+        print(f"{YELLOW}[i] {label}: no hay candidatos que probar.{RESET}")
+        return found
+
+    print(f"\n{YELLOW}[*] {label}: probando {total} candidatos con {threads} hilos...{RESET}")
+    wild = WildcardDetector(resolvers)
+    w_ips, w_cnames = wild.profile(domain)
+    if w_ips or w_cnames:
+        print(f"{YELLOW}[!] Wildcard DNS detectado en {domain}: se filtraran respuestas "
+              f"identicas al wildcard.{RESET}")
+
+    def work(name: str):
+        status, ips, cnames = dns_resolve(name, resolvers)
+        if status != "ok":
+            return None
+        return name, ips, cnames, wild.is_wildcard(name, ips, cnames)
+
+    start = time.time()
+    done = 0
+    filtered = 0
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+    batch_size = threads * 20
+    try:
+        for i in range(0, total, batch_size):
+            futures = [executor.submit(work, n) for n in cands[i:i + batch_size]]
+            for fut in concurrent.futures.as_completed(futures):
+                res = fut.result()
+                done += 1
+                if res:
+                    name, ips, cnames, is_wild = res
+                    if is_wild:
+                        filtered += 1
+                    else:
+                        found[name] = {"ips": ips, "cnames": cnames}
+                        sys.stdout.write("\r" + " " * 78 + "\r")
+                        print(format_hit(name, ips, cnames))
+                if done % 50 == 0 or done == total:
+                    rate = done / max(time.time() - start, 0.001)
+                    sys.stdout.write(f"\r  progreso: {done}/{total} ({rate:.0f} q/s) | "
+                                     f"hallazgos: {len(found)}   ")
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}[!] Interrumpido por el usuario; se conservan los resultados parciales.{RESET}")
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
+    elapsed = round(time.time() - start, 1)
+    print(f"\n{CYAN}[OK] {label} terminado en {elapsed}s | nuevos: {BOLD}{len(found)}{RESET}"
+          f"{CYAN} | filtrados por wildcard: {filtered}{RESET}")
+    return found
+
+
+def _ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
+    raw = input(f"{BOLD}{prompt} [{default}]: {RESET}").strip()
+    if not raw:
+        return default
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return default
+
+
+def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[str]]]:
+    """Menu interactivo de enumeracion activa. Devuelve {subdominio: {ips, cnames}}."""
+    print(f"\n{MAGENTA}============================================================{RESET}")
+    print(f" {BOLD}ENUMERACION ACTIVA: diccionario + permutaciones + fuzzing ({domain}){RESET}")
+    print(f" {YELLOW}Envia consultas DNS directas a los resolvers; NO es trafico pasivo.{RESET}")
+    print(f"{MAGENTA}============================================================{RESET}")
+
+    print(f"\n{RED}{BOLD}[ AVISO ]{RESET} {RED}Esta seccion es ACTIVA: genera trafico DNS real y masivo "
+          f"hacia los resolvers y el dominio objetivo.{RESET}")
+    print(f"{RED}          Usala solo sobre dominios propios o con autorizacion expresa. "
+          f"El uso es responsabilidad del auditor.{RESET}")
+
+    print(f"\n {BOLD}1.{RESET} Diccionario (bruteforce de subdominios)")
+    print(f" {BOLD}2.{RESET} Permutaciones (sobre subdominios conocidos / hallados)")
+    print(f" {BOLD}3.{RESET} Fuzzing con plantilla (FUZZ / NUM)")
+    print(f" {BOLD}4.{RESET} Todo (1 + 2 + 3)")
+    choice = input(f"\n{BOLD}Selecciona tecnica (1-4) [4]: {RESET}").strip() or "4"
+    if choice not in ("1", "2", "3", "4"):
+        print(f"{RED}[!] Opcion invalida.{RESET}")
+        return {}
+    do_dict = choice in ("1", "4")
+    do_perm = choice in ("2", "4")
+    do_fuzz = choice in ("3", "4")
+
+    words = list(dict.fromkeys(BUILTIN_WORDLIST))
+    if do_dict or do_fuzz:
+        path = input(f"{BOLD}Ruta a diccionario propio (Enter = integrado, {len(words)} palabras): {RESET}").strip()
+        if path:
+            loaded = load_wordlist(path)
+            if loaded:
+                words = loaded
+                print(f"{GREEN}[+] Diccionario cargado: {len(words)} palabras.{RESET}")
+            else:
+                print(f"{YELLOW}[i] Se usara el diccionario integrado.{RESET}")
+
+    threads = _ask_int("Hilos concurrentes", 100, 1, 500)
+    raw_res = input(f"{BOLD}Resolvers DNS (IPv4, separados por comas; Enter = {', '.join(DEFAULT_RESOLVERS)}): {RESET}").strip()
+    resolvers: List[str] = []
+    for r in raw_res.split(",") if raw_res else []:
+        try:
+            ip = ipaddress.ip_address(r.strip())
+            if ip.version == 4:
+                resolvers.append(str(ip))
+        except ValueError:
+            pass
+    resolvers = resolvers or list(DEFAULT_RESOLVERS)
+
+    results: Dict[str, Dict[str, List[str]]] = {}
+    seeds: Set[str] = set(known)
+
+    if do_dict:
+        cands = dictionary_candidates(domain, words) - known
+        hits = run_active_resolution(cands, domain, resolvers, threads, "Diccionario")
+        results.update(hits)
+        seeds |= set(hits)
+
+    if do_perm:
+        if not seeds:
+            print(f"\n{YELLOW}[i] No hay subdominios semilla. Ejecuta antes el escaneo pasivo "
+                  f"o la tecnica de diccionario para poder permutar.{RESET}")
+        else:
+            perms = generate_permutations(seeds, domain) - set(results) - known
+            print(f"\n{CYAN}[i] {len(perms)} permutaciones generadas a partir de {len(seeds)} semillas.{RESET}")
+            if perms:
+                cap = _ask_int("Maximo de permutaciones a probar (las mas cortas primero)",
+                               min(len(perms), 100000), 1, len(perms))
+                chosen = sorted(perms, key=lambda x: (len(x), x))[:cap]
+                hits = run_active_resolution(chosen, domain, resolvers, threads, "Permutaciones")
+                results.update(hits)
+
+    if do_fuzz:
+        print(f"\n{CYAN}Plantilla: FUZZ = palabra del diccionario, NUM = 0-99 (y 00-09).{RESET}")
+        print(f"{CYAN}Ejemplos: api-FUZZ | FUZZ.dev | app-NUM | FUZZ-NUM.internal{RESET}")
+        template = input(f"{BOLD}Plantilla (se añade .{domain} si falta; Enter = omitir): {RESET}").strip()
+        if template:
+            cands = expand_fuzz_template(template, domain, words) - known - set(results)
+            if cands:
+                hits = run_active_resolution(cands, domain, resolvers, threads, "Fuzzing")
+                results.update(hits)
+            else:
+                print(f"{YELLOW}[!] La plantilla no genero candidatos validos (usa FUZZ y/o NUM).{RESET}")
+
+    print(f"\n{BOLD}{GREEN}[+] Enumeracion activa: {len(results)} subdominios nuevos.{RESET}")
+    return results
+
+
 def filter_by_keywords(subdomains: Set[str], keywords: List[str]) -> List[Tuple[str, str]]:
     """Encuentra subdominios que contienen indicios de logins/paneles y su etiqueta."""
     matches = []
@@ -360,7 +850,8 @@ def filter_by_keywords(subdomains: Set[str], keywords: List[str]) -> List[Tuple[
     return matches
 
 
-def save_results(domain: str, matches: List[Tuple[str, str]], all_subs: Set[str], dns_info: Dict = None):
+def save_results(domain: str, matches: List[Tuple[str, str]], all_subs: Set[str], dns_info: Dict = None,
+                 active_results: Dict = None):
     """Exporta el reporte consolidado a archivo de texto."""
     filename = f"{domain}_subcat_report.txt"
     try:
@@ -382,6 +873,13 @@ def save_results(domain: str, matches: List[Tuple[str, str]], all_subs: Set[str]
             f.write(f"[+] CANDIDATOS A PANELES / LOGINS / INTERFACES ({len(matches)}):\n")
             for sub, tag in matches:
                 f.write(f"  - {sub}  (tag: {tag})\n")
+
+            if active_results:
+                f.write(f"\n[+] ENUMERACION ACTIVA - SUBDOMINIOS NUEVOS ({len(active_results)}):\n")
+                for host, info in sorted(active_results.items()):
+                    ip_s = ", ".join(info["ips"]) or "-"
+                    cn_s = ", ".join(info["cnames"]) or "-"
+                    f.write(f"  - {host}  IP: {ip_s}  CNAME: {cn_s}\n")
 
             f.write(f"\n[+] TODOS LOS SUBDOMINIOS DESCUBIERTOS ({len(all_subs)}):\n")
             for s in sorted(all_subs):
@@ -426,6 +924,7 @@ def main():
     all_discovered: Set[str] = set()
     candidate_logins: List[Tuple[str, str]] = []
     dns_audit: Dict = {}
+    active_results: Dict = {}
 
     # Menu interactivo por pasos
     while True:
@@ -435,9 +934,10 @@ def main():
         print(f" {BOLD}3.{RESET} {BOLD}Escaneo Completo + Dig Profundo{RESET} (Busqueda + Auditoria total)")
         print(f" {BOLD}4.{RESET} Resolver CNAME e IPs de los logins encontrados (Descubrir Okta, AWS, etc.)")
         print(f" {BOLD}5.{RESET} Ver / Añadir palabras clave de filtrado")
-        print(f" {BOLD}6.{RESET} Salir")
+        print(f" {BOLD}6.{RESET} {RED}Enumeracion ACTIVA{RESET} (Diccionario + Permutaciones + Fuzzing)")
+        print(f" {BOLD}7.{RESET} Salir")
 
-        opcion = input(f"\n{BOLD}Selecciona una opcion (1-6): {RESET}").strip()
+        opcion = input(f"\n{BOLD}Selecciona una opcion (1-7): {RESET}").strip()
 
         if opcion == "1":
             all_discovered = run_parallel_scan(target_domain)
@@ -473,10 +973,19 @@ def main():
                         keywords.append(w_clean)
                 print(f"{GREEN}[+] Palabras clave actualizadas.{RESET}")
         elif opcion == "6":
+            if not all_discovered:
+                pre = input(f"\n{BOLD}¿Ejecutar antes el escaneo pasivo para obtener semillas de permutacion? (s/n) [s]: {RESET}").strip().lower()
+                if pre in ["", "s", "si", "y", "yes"]:
+                    all_discovered = run_parallel_scan(target_domain)
+            active_results = run_active_enum(target_domain, all_discovered)
+            all_discovered = set(all_discovered) | set(active_results)
+            candidate_logins = filter_by_keywords(all_discovered, keywords)
+            break
+        elif opcion == "7":
             print(f"{YELLOW}Operacion finalizada.{RESET}")
             sys.exit(0)
         else:
-            print(f"{RED}[!] Opcion invalida. Elige un numero del 1 al 6.{RESET}")
+            print(f"{RED}[!] Opcion invalida. Elige un numero del 1 al 7.{RESET}")
 
     # Mostrar resultados de logins
     if all_discovered:
@@ -499,7 +1008,7 @@ def main():
     print("\n" + "-" * 64)
     guardar = input(f"{BOLD}¿Deseas exportar el reporte consolidado a un archivo? (s/n): {RESET}").strip().lower()
     if guardar in ["s", "si", "y", "yes"]:
-        save_results(target_domain, candidate_logins, all_discovered, dns_audit)
+        save_results(target_domain, candidate_logins, all_discovered, dns_audit, active_results)
 
 
 if __name__ == "__main__":
