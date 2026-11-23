@@ -110,7 +110,7 @@ Without any of them the tool still works: it uses its own DNS resolver and socke
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/subcat-hunter
+git clone https://github.com/JosepJcr/subcat-hunter
 cd subcat-hunter
 chmod +x subcat-hunter.py
 ```
