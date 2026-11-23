@@ -1,92 +1,113 @@
-# SubCat Hunter - Passive Attack Surface & Hidden Login Hunter
+# SubCat Hunter - Attack Surface & Hidden Login Hunter
 
 ```text
        /\_/\  
       ( o.o )   S U B C A T   H U N T E R :: Passive Login Hunter & Deep Dig v3.0
-       > ^ <    [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum (dnsx) ]
+       > ^ <    [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum ]
       (_|_|_)   
 ```
 
-An automated, interactive wrapper and reconnaissance interface designed to discover hidden administrative interfaces, single sign-on (SSO) portals, staging environments, and corporate logins. Its core workflow is passive (zero packets to the target), with an optional, clearly-labeled **active enumeration** mode for dictionary, permutation, and fuzzing-based discovery when you have authorization to query the target directly.
+An interactive reconnaissance tool to discover hidden administrative interfaces, single sign-on (SSO) portals, staging environments, and corporate logins. Its core workflow is **passive** (no packets sent to the target). It also includes clearly labeled **active** modules (dictionary, permutation and fuzzing enumeration, wildcard DNS analysis, and TCP port scanning) for use when you are authorized to query the target directly.
+
+Everything runs from a numbered CLI menu, with no flags to remember. The prompts are in Spanish.
 
 ---
 
 ## Attribution & Relationship to Subcat
 
-> **Important Note**: **[Subcat](https://github.com/skat/subcat)** is an independent, standalone open-source project created by its respective authors. 
+> **Important Note**: **[Subcat](https://github.com/duty1g/subcat)** is an independent, standalone open-source project created by its respective authors.
 >
-> This project is **not** the original Subcat repository. This tool serves as an **automated interactive wrapper and workflow manager** that utilizes Subcat and compatible passive discovery methodologies as its underlying engine. It adds:
-> - A guided, step-by-step numbered CLI menu (no manual flags required).
-> - Interactive domain and apex/root scope detection.
+> This project is **not** the original Subcat repository. SubCat Hunter has its own passive engines and can additionally call the external `subcat` binary (if it is in your `PATH`) as one more source of subdomains in the full pipeline. It adds:
+> - A guided, numbered CLI menu.
+> - Apex/root scope detection.
 > - Passive DNS-over-HTTPS (DoH) infrastructure auditing (Deep Dig).
-> - Automated keyword classification and cloud-provider mapping for candidate login interfaces.
+> - Keyword classification and cloud-provider mapping for candidate login interfaces.
+> - Active enumeration, wildcard analysis, port scanning and consolidated reporting.
 
-All credit for the original Subcat tool and its passive data collection concepts belongs to the original Subcat developers.
+All credit for the original Subcat tool belongs to its developers.
 
 ---
 
-## Zero-Traffic Philosophy (Passive Mode)
+## Passive vs. Active
 
-By default, options 1-5 of SubCat Hunter operate on a strict **zero-contact model**:
+| Options | Mode | Traffic |
+|---|---|---|
+| `1`, `2`, `3`, `4`, `5` | Passive | Queries to public third-party services and Cloudflare DoH. Nothing is sent to the target's own servers or nameservers. |
+| `9` (mode 1) | Passive | Certificate transparency logs and DoH probing. |
+| `6`, `8`, `9` (modes 2 and 3), `10` | **Active** | Direct DNS queries and/or TCP connections against the target and its resolvers. |
 
-1. **No direct HTTP/HTTPS connections** to the target domain or its IP infrastructure.
-2. **No direct DNS queries** to the target's authoritative nameservers.
-3. **Public data only**: All intelligence is gathered by querying public Certificate Transparency (CT) logs, historical web search caches, and public passive DNS databases.
-4. **Cloudflare DNS-over-HTTPS (DoH)**: All DNS and deep infrastructure queries are routed securely through Cloudflare's public resolver (`1.1.1.1`), ensuring zero interaction with the target's network.
+### What "passive" means here
 
-This makes passive mode safe for Attack Surface Management (ASM), shadow IT auditing, external risk assessments, and defensive perimeter evaluations.
+1. No HTTP/HTTPS connections to the target domain or its IPs.
+2. No DNS queries to the target's authoritative nameservers.
+3. Intelligence comes from public Certificate Transparency logs, passive DNS databases and web scan archives.
+4. DNS lookups go through Cloudflare's public DoH resolver.
 
-> **Note**: Option `6` (Active Enumeration) is the one exception to this model — see below. It is opt-in, clearly labeled, and requires explicit confirmation of scope before it runs.
+The domain name you analyze is still sent to those third parties (RapidDNS, CertSpotter, HackerTarget, URLScan, crt.sh, AlienVault OTX and Cloudflare). Passive mode is suited to Attack Surface Management (ASM), shadow IT auditing and external risk assessments.
+
+> **Warning**: Options `6`, `8`, `9` (active modes) and `10` generate real, direct and potentially massive traffic. Use them only on domains you own or are explicitly authorized to test.
 
 ---
 
 ## Features
 
-- **Automated Workflow & Wrapper**: Replaces manual flag entry with an interactive numbered interface (1, 2, 3...).
-- **Parallel Multi-Engine Search**: Concurrently queries public intelligence sources using Python's `ThreadPoolExecutor`:
-  - **RapidDNS**: Comprehensive passive DNS dataset.
-  - **CertSpotter (SSLMate)**: Real-time Certificate Transparency logs.
-  - **HackerTarget**: Historical DNS host search.
-  - **URLScan.io**: Public internet scan database.
-  - **crt.sh**: Sectigo Certificate Transparency archive with built-in timeout handling.
-  - **AlienVault OTX**: Passive DNS indicator records with rate-limit tolerance.
-- **Deep Dig DNS Audit**:
-  - Automatically queries `NS`, `MX`, `A`, `AAAA`, `CNAME`, `TXT`, `SOA`, `CAA`, and `_dmarc` records via encrypted DoH.
-  - Parses `TXT` verification tokens to detect third-party SaaS platforms (Google Workspace, Microsoft 365, Okta, Atlassian, Zoom, DocuSign, Proofpoint, Zendesk).
-- **Targeted Keyword Classification**:
-  - Flags subdomains matching login and administrative tags (`admin`, `sso`, `login`, `vpn`, `portal`, `identity`, `dev`, `stage`, `qa`, etc.).
-  - Displays the specific matched tag alongside the domain.
-- **Apex Domain Intelligence**:
-  - If a user inputs a subdomain (e.g., `stats.example.com`), the tool detects the apex domain (`example.com`) and offers to scan the entire organization or limit scope to the specific host.
-- **Cloud Provider Resolution**:
-  - Resolves CNAME and A records of flagged login portals to identify underlying cloud providers (Okta, AWS CloudFront, Akamai Edge, Azure Traffic Manager, Cloudflare).
-- **Active Enumeration (opt-in, option `6`)**:
-  - **Dictionary**: brute-forces subdomains against a large built-in wordlist (500+ entries) or your own custom wordlist file.
-  - **Permutations**: altdns-style mutation of already-discovered subdomains (label insertion, prefix/suffix, numeric variations, environment-token swaps like `dev` ↔ `prod`).
-  - **Fuzzing**: template-based expansion using `FUZZ` (dictionary words) and `NUM` (0-99) placeholders, e.g. `api-FUZZ`, `app-NUM`.
-  - **Resolution engine**: queries are resolved via the external [`dnsx`](https://github.com/projectdiscovery/dnsx) tool (ProjectDiscovery) when available, with its native wildcard filter (`-wd`) applied automatically. If `dnsx` is not installed, the tool transparently falls back to its own pure-Python DNS resolver.
-  - **Wildcard detection**: profiles each zone with randomized lookups to filter out wildcard DNS false positives before reporting a hit.
-  - Requires an explicit on-screen acknowledgment that this mode sends real, direct DNS traffic to the target before it runs.
-- **Dynamic Session Awareness**:
-  - Adapts greetings and report authorship to the active system user.
+### Passive
+- **Parallel multi-engine search** (`ThreadPoolExecutor`):
+  - **RapidDNS**, **CertSpotter (SSLMate)**, **HackerTarget**, **URLScan.io**, **crt.sh**, **AlienVault OTX**.
+  - Each engine fails silently on timeouts or rate limits, so one outage does not stop the scan.
+- **Deep Dig DNS audit** via DoH:
+  - Queries `NS`, `MX`, `A`, `AAAA`, `CNAME`, `TXT`, `SOA`, `CAA` and `_dmarc` records.
+  - Flags SPF records and TXT tokens for Google Workspace, Microsoft 365, Okta, Atlassian, DocuSign and Zoom.
+  - Warns when no public DMARC record exists.
+- **Keyword classification**: flags subdomains matching login and admin tags (`admin`, `sso`, `login`, `vpn`, `portal`, `identity`, `jenkins`, `grafana`, `dev`, `stage`, `qa`, ...). You can add your own keywords (option `5`). The root domain is excluded from matching, so a domain like `digital.com` does not match `git` on every host.
+- **Apex domain detection**: if you enter `stats.example.com`, the tool detects `example.com` (including multi-part TLDs such as `co.uk` or `com.mx`) and lets you scan the whole organization or only that host.
+- **Cloud provider resolution**: resolves CNAME and A records of flagged portals and tags Okta, AWS CloudFront, Azure, Cloudflare and Akamai.
+
+### Active
+- **Active enumeration (option `6`)**:
+  - **Dictionary**: brute-forces subdomains with the built-in wordlist (several hundred entries) or your own file.
+  - **Permutations**: altdns-style mutation of known subdomains (label insertion, prefix/suffix with and without hyphen, numeric variations, environment-token swaps such as `dev` <-> `prod`). You can cap how many to test; the shortest are tried first.
+  - **Fuzzing**: templates with `FUZZ` (wordlist words) and `NUM` (0-99 and 00-09), e.g. `api-FUZZ`, `FUZZ.dev`, `app-NUM`.
+  - **Resolution engine**: uses the external [`dnsx`](https://github.com/projectdiscovery/dnsx) binary when available. If `dnsx` is missing, fails, or returns no output, the tool falls back to its own pure-Python UDP DNS resolver.
+  - **Wildcard filtering**: each zone is profiled with random-name lookups, and hits identical to the wildcard response are discarded.
+  - **Takeover hints**: a CNAME with no IP is flagged as a possible dangling record (GitHub Pages, Heroku, Netlify, Vercel, Fastly, Zendesk, Shopify, Azure App Service, AWS, etc.).
+- **Wildcard DNS enumeration (option `9`)**:
+  - Finds `*.zone` certificates in crt.sh and CertSpotter, and probes the apex, those zones and the parent zones of known subdomains.
+  - Modes: passive (DoH), active (direct DNS) or both. Active modes also brute-force inside each wildcard zone, filtering wildcard responses.
+- **TCP port scanning (option `10`)**:
+  - Targets: the domain only, the domain plus all discovered subdomains, or a manual host list.
+  - Ports: `top` (43 common ports), `full` (1-65535) or a custom list/range such as `22,80,8000-8100`.
+  - Engine: `nmap` if installed (SYN scan as root, connect scan otherwise, optional `-sV` service detection), or a built-in threaded TCP connect scanner.
+  - Hosts are grouped by IP so the same machine is never scanned twice.
+- **Full pipeline (option `8`)**: runs the external `subcat` binary (if present), the passive scan, Deep Dig, and dictionary, permutation and fuzzing enumeration non-interactively, then saves the report automatically. You must type the target domain to confirm authorization before it starts.
+
+### General
+- **Consolidated report**: exports `<domain>_subcat_report.txt` with execution stats, subdomains, login candidates, DNS records, active findings, wildcard info and open ports.
+- **Dynamic session awareness**: greetings and report authorship use the active system user.
+- **Graceful interruption**: `Ctrl+C` during an active run keeps the partial results.
 
 ---
 
 ## Prerequisites
 
 - **Python 3.8+**
-- No external Python dependencies required for passive mode (pure standard library).
-- **Optional** — for Active Enumeration (option `6`): [`dnsx`](https://github.com/projectdiscovery/dnsx) in your `PATH`.
-  ```bash
-  go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-  ```
-  Without it, option `6` still works, using the built-in fallback resolver instead.
+- No external Python dependencies (standard library only).
+- **Optional external tools**:
+  - [`dnsx`](https://github.com/projectdiscovery/dnsx) for faster active resolution (options `6`, `8`, `9`):
+    ```bash
+    go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+    ```
+  - [`subcat`](https://github.com/duty1g/subcat) as an extra source in the full pipeline (option `8`):
+    ```bash
+    go install github.com/duty1g/subcat/cmd/subcat@latest
+    ```
+  - [`nmap`](https://nmap.org/download) for port scanning with service detection (option `10`).
+
+Without any of them the tool still works: it uses its own DNS resolver and socket scanner and skips `subcat`.
 
 ---
 
 ## Installation
-
-Clone the repository and set execution permissions:
 
 ```bash
 git clone https://github.com/your-username/subcat-hunter
@@ -98,25 +119,38 @@ chmod +x subcat-hunter.py
 
 ## Usage
 
-Run the script interactively:
-
 ```bash
 python3 subcat-hunter.py
 ```
 
+Run the built-in self-tests (port parsing, local TCP scan, nmap parsing, keyword filter):
+
+```bash
+python3 subcat-hunter.py --selftest
+```
+
 ### Workflow
 
-1. **Enter Target**: Input the domain when prompted (e.g., `example.com` or `dev.example.com`).
-2. **Scope Selection**: If a subdomain is entered, choose whether to scan the whole organization or just the subdomain.
-3. **Menu Option**:
-   - `1`: Turbo Multi-Engine Scan (Find passive subdomains and candidate logins).
-   - `2`: Deep Dig DNS (Audit infrastructure, SaaS tokens, and DMARC).
-   - `3`: Full Scan + Deep Dig (Execute both concurrently).
-   - `4`: Resolve CNAME/IP (Map candidate logins to cloud providers).
-   - `5`: View / Add custom keywords.
-   - `6`: **Active Enumeration** (dictionary + permutations + fuzzing, resolved via `dnsx`). Sends real DNS traffic — use only on domains you own or are authorized to test.
-   - `7`: Exit.
-4. **Report Export**: Choose whether to save the consolidated report to `<domain>_subcat_report.txt`.
+1. **Enter target**: e.g. `example.com` or `dev.example.com`.
+2. **Scope selection**: if you entered a subdomain, choose the whole organization (recommended) or just that host.
+3. **Menu option**:
+
+| Option | Description | Mode |
+|---|---|---|
+| `1` | Turbo multi-engine scan: passive subdomains and candidate logins | Passive |
+| `2` | Deep Dig DNS: infrastructure, SaaS tokens, SPF/DMARC (offers a follow-up subdomain scan) | Passive |
+| `3` | Full scan + Deep Dig | Passive |
+| `4` | Resolve CNAME/IP of the login candidates (maps them to cloud providers) | Passive |
+| `5` | View / add filter keywords | - |
+| `6` | Active enumeration: dictionary + permutations + fuzzing | **Active** |
+| `7` | Exit (goes through report export if there are unsaved results) | - |
+| `8` | **Full pipeline**: subcat + passive + Dig + active + automatic report | **Active** |
+| `9` | Wildcard DNS enumeration: certificates, probing and filtered brute force | Passive / **Active** |
+| `10` | TCP port scan: top / full / custom, domain and subdomains | **Active** |
+
+4. **Results and report**: candidate logins are listed, with an optional CNAME/IP resolution. You are then asked whether to export the report. Option `8` saves it automatically.
+
+Options `4`, `5` and `9` return to the menu. Options `1`, `2`, `3`, `6` and `10` run once and then move on to the results and export step.
 
 ---
 
@@ -126,7 +160,7 @@ python3 subcat-hunter.py
        /\_/\  
       ( o.o )   S U B C A T :: Passive Login Hunter & Deep Dig v3.0
        > ^ <    >> Hello, auditor! Passive reconnaissance & deep audit <<
-      (_|_|_)   [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum (dnsx) ]
+      (_|_|_)   [ Multi-Engine OSINT | Deep Dig | Passive + Active Enum ]
 
   [+] Hello, auditor! Session initialized. Ready to audit.
 
@@ -137,11 +171,14 @@ Introduce el dominio a analizar: example.com
  2. Dig Profundo DNS (Auditoria DNS, SaaS Cloud, SPF/DMARC)
  3. Escaneo Completo + Dig Profundo (Busqueda + Auditoria total)
  4. Resolver CNAME e IPs de los logins encontrados (Descubrir Okta, AWS, etc.)
- 5. Ver / Anadir palabras clave de filtrado
+ 5. Ver / Añadir palabras clave de filtrado
  6. Enumeracion ACTIVA (Diccionario + Permutaciones + Fuzzing)
  7. Salir
+ 8. PIPELINE COMPLETO (subcat + pasivo + Dig + activa + informe automatico)
+ 9. Enumeracion WILDCARD (pasiva o activa: certificados *., sondeo y bruteforce filtrado)
+ 10. Escaneo de PUERTOS (top / completo / especifico, dominio y subdominios)
 
-Selecciona una opcion (1-7): 1
+Selecciona una opcion (1-10): 1
 
 [*] Iniciando consultas pasivas en paralelo (Zero-Traffic)...
   [+] URLScan      :  13 subdominios
@@ -166,18 +203,35 @@ Selecciona una opcion (1-7): 1
 
 ---
 
+## Report Contents
+
+The exported `<domain>_subcat_report.txt` can include:
+
+- Execution summary per technique (engine, candidates, hits, wildcard-filtered, time)
+- Subdomains found by the external `subcat` tool
+- Deep DNS audit records
+- Login/panel/interface candidates with their matched tag
+- Active enumeration results grouped by technique (Dictionary, Permutations, Fuzzing, Wildcard), with IPs and CNAMEs
+- Wildcard DNS findings (certificate zones and active wildcards)
+- Open ports and detected services per IP
+- Full list of discovered subdomains
+
+---
+
 ## Defensive Applications
 
-- **Shadow IT Discovery**: Identifies abandoned staging or pre-production hosts (`stage-admin`, `dev-login`) exposed to the public internet.
-- **Credential Surface Management**: Maps public-facing authentication gateways (Okta, Azure AD, custom login forms) before adversaries do.
-- **Certificate Hygiene**: Audits valid and expired certificates across all public log monitors.
-- **DNS & Mail Security Verification**: Validates SPF include limits, DMARC enforcement policies (`p=reject` vs `p=none`), and third-party SaaS verification footprints.
+- **Shadow IT discovery**: finds forgotten staging or pre-production hosts (`stage-admin`, `dev-login`) exposed to the internet.
+- **Credential surface management**: maps public authentication gateways (Okta, Azure AD, custom login forms).
+- **Subdomain takeover detection**: spots dangling CNAMEs pointing to third-party services.
+- **Certificate hygiene**: reviews wildcard and per-host certificates in public CT logs.
+- **DNS & mail security verification**: checks SPF, DMARC policy and third-party SaaS verification footprints.
+- **Exposure checks**: identifies unexpectedly open services on discovered hosts.
 
 ---
 
 ## Disclaimer
 
-This software is intended for authorized security auditing, defensive asset management, and educational purposes. It gathers publicly available data without interacting directly with the target infrastructure. Always ensure compliance with applicable laws and corporate security policies.
+This software is intended for authorized security auditing, defensive asset management, and educational purposes. The passive options only use publicly available data sources. The active options (`6`, `8`, `9` in active modes, and `10`) interact directly with the target's infrastructure and with DNS resolvers, and may be illegal or violate policies if used without written authorization. You are solely responsible for how you use this tool.
 
 ---
 

@@ -23,7 +23,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Dict, Iterable, List, Set, Tuple
+import xml.etree.ElementTree as ET
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # Colores ANSI para la terminal
 CYAN = "\033[96m"
@@ -350,6 +351,8 @@ def resolve_candidate_logins(candidates: List[Tuple[str, str]]):
 
 
 # --- Enumeracion ACTIVA: diccionario, permutaciones y fuzzing (DNS directo) ---
+
+RUN_STATS: List[Dict] = []  # resumen de cada tanda (para el informe)
 
 DEFAULT_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"]
 DNS_TIMEOUT = 2.5
@@ -714,7 +717,7 @@ def run_active_resolution(candidates: Iterable[str], domain: str, resolvers: Lis
                     if is_wild:
                         filtered += 1
                     else:
-                        found[name] = {"ips": ips, "cnames": cnames}
+                        found[name] = {"ips": ips, "cnames": cnames, "source": label}
                         sys.stdout.write("\r" + " " * 78 + "\r")
                         print(format_hit(name, ips, cnames))
                 if done % 50 == 0 or done == total:
@@ -731,6 +734,8 @@ def run_active_resolution(candidates: Iterable[str], domain: str, resolvers: Lis
             executor.shutdown(wait=False)
 
     elapsed = round(time.time() - start, 1)
+    RUN_STATS.append({"label": label, "engine": "resolver interno", "tested": done,
+                      "total": total, "hits": len(found), "filtered": filtered, "secs": elapsed})
     print(f"\n{CYAN}[OK] {label} terminado en {elapsed}s | nuevos: {BOLD}{len(found)}{RESET}"
           f"{CYAN} | filtrados por wildcard: {filtered}{RESET}")
     return found
@@ -770,6 +775,8 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
 
     tmp_path = None
     proc = None
+    errf = None
+    filtered = 0
     start = time.time()
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
@@ -784,17 +791,21 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
             "-r", ",".join(resolvers),
             "-t", str(threads),
             "-a", "-cname", "-resp",
-            "-wd", domain,
             "-json",
         ]
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        # stderr a fichero: un PIPE sin leer puede llenarse y bloquear dnsx y este proceso
+        errf = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="ignore")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
                                 text=True, bufsize=1)
         done = 0
+        raw_lines = 0
+        filtered = 0
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
+            raw_lines += 1
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
@@ -806,7 +817,10 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
             cnames = [c.rstrip(".") for c in rec.get("cname", []) if c]
             if not ips and not cnames:
                 continue
-            found[name] = {"ips": ips, "cnames": cnames}
+            if wild.is_wildcard(name, ips, cnames):
+                filtered += 1
+                continue
+            found[name] = {"ips": ips, "cnames": cnames, "source": label}
             done += 1
             sys.stdout.write("\r" + " " * 78 + "\r")
             print(format_hit(name, ips, cnames))
@@ -815,6 +829,14 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
                 sys.stdout.write(f"\r  progreso: {done} hallazgos ({rate:.0f} q/s)   ")
                 sys.stdout.flush()
         proc.wait()
+        errf.seek(0)
+        err = errf.read().strip()
+        if proc.returncode not in (0, None) or (raw_lines == 0 and err):
+            print(f"{RED}[-] dnsx devolvio codigo {proc.returncode} y {raw_lines} lineas. "
+                  f"stderr: {err[:300] or '(vacio)'}{RESET}")
+            print(f"{YELLOW}[i] Reintentando esta tanda con el resolver interno...{RESET}")
+            return run_active_resolution(cands, domain, resolvers, threads, label)
+        print(f"{CYAN}[i] dnsx: {raw_lines} respuestas | filtradas por wildcard: {filtered}{RESET}")
     except FileNotFoundError:
         print(f"{RED}[-] No se pudo ejecutar dnsx (binario no encontrado al lanzar el proceso).{RESET}")
         return run_active_resolution(cands, domain, resolvers, threads, label)
@@ -826,6 +848,8 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
             except Exception:
                 pass
     finally:
+        if errf is not None:
+            errf.close()
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -833,6 +857,8 @@ def run_dnsx_resolution(candidates: Iterable[str], domain: str, resolvers: List[
                 pass
 
     elapsed = round(time.time() - start, 1)
+    RUN_STATS.append({"label": label, "engine": "dnsx", "tested": total, "total": total,
+                      "hits": len(found), "filtered": filtered, "secs": elapsed})
     print(f"\n{CYAN}[OK] {label} (dnsx) terminado en {elapsed}s | hallazgos: {BOLD}{len(found)}{RESET}")
     return found
 
@@ -939,12 +965,408 @@ def run_active_enum(domain: str, known: Set[str]) -> Dict[str, Dict[str, List[st
     return results
 
 
-def filter_by_keywords(subdomains: Set[str], keywords: List[str]) -> List[Tuple[str, str]]:
+# --- Integracion con subcat (duty1g/subcat) y pipeline completo ---
+
+DEFAULT_FUZZ_TEMPLATES = ["api-FUZZ", "FUZZ.dev"]
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def run_subcat_tool(domain: str) -> Set[str]:
+    """Ejecuta la herramienta externa subcat (duty1g/subcat) en modo pasivo si esta en el PATH
+    y extrae los subdominios de su salida."""
+    exe = shutil.which("subcat")
+    if not exe:
+        print(f"{YELLOW}[i] subcat no esta en el PATH; se omite. Instalacion: "
+              f"go install github.com/duty1g/subcat/cmd/subcat@latest{RESET}")
+        RUN_STATS.append({"label": "subcat (herramienta externa)", "engine": "no instalado",
+                          "tested": 0, "total": 0, "hits": 0, "filtered": 0, "secs": 0})
+        return set()
+    print(f"\n{YELLOW}[*] Ejecutando subcat (pasivo) sobre {domain}...{RESET}")
+    start = time.time()
+    found: Set[str] = set()
+    for args in (["-d", domain, "-silent"], ["-d", domain]):
+        try:
+            out = subprocess.run([exe] + args, capture_output=True, text=True, timeout=300)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"{RED}[-] subcat fallo: {e}{RESET}")
+            break
+        text = _ANSI_RE.sub("", (out.stdout or "") + "\n" + (out.stderr or "")).lower()
+        found = {normalize_subdomain(m, domain)
+                 for m in re.findall(rf"[\w.*-]+\.{re.escape(domain)}", text)}
+        found.discard("")
+        if found or out.returncode == 0:
+            break
+    elapsed = round(time.time() - start, 1)
+    print(f"{CYAN}[OK] subcat: {BOLD}{len(found)}{RESET}{CYAN} subdominios en {elapsed}s{RESET}")
+    RUN_STATS.append({"label": "subcat (herramienta externa)", "engine": "subcat", "tested": 0,
+                      "total": 0, "hits": len(found), "filtered": 0, "secs": elapsed})
+    return found
+
+
+def run_full_pipeline(domain: str) -> Dict:
+    """Pipeline completo y no interactivo: subcat + pasivo + Dig DNS + activa
+    (diccionario, permutaciones, fuzzing). Devuelve todo lo necesario para el informe."""
+    print(f"\n{RED}{BOLD}[ AVISO ]{RESET} {RED}El pipeline completo incluye enumeracion ACTIVA "
+          f"(trafico DNS masivo contra {domain}).{RESET}")
+    print(f"{RED}          Continua solo si tienes autorizacion expresa sobre este dominio.{RESET}")
+    confirm = input(f"{BOLD}Escribe el dominio '{domain}' para confirmar autorizacion: {RESET}").strip().lower()
+    if confirm != domain:
+        print(f"{YELLOW}[!] Confirmacion no valida. Pipeline cancelado.{RESET}")
+        return {}
+
+    RUN_STATS.clear()
+    subcat_subs = run_subcat_tool(domain)
+    passive = run_parallel_scan(domain)
+    RUN_STATS.append({"label": "Pasivo multi-fuente", "engine": "OSINT", "tested": 0, "total": 0,
+                      "hits": len(passive), "filtered": 0, "secs": 0})
+    dns_audit = run_deep_dig(domain)
+    known = set(passive) | subcat_subs
+
+    words = list(dict.fromkeys(BUILTIN_WORDLIST))
+    resolvers = list(DEFAULT_RESOLVERS)
+    threads = 100
+    results: Dict[str, Dict] = {}
+    seeds: Set[str] = set(known)
+
+    cands = dictionary_candidates(domain, words) - known
+    hits = run_dnsx_resolution(cands, domain, resolvers, threads, "Diccionario")
+    results.update(hits)
+    seeds |= set(hits)
+
+    perms = generate_permutations(seeds, domain) - set(results) - known
+    print(f"\n{CYAN}[i] {len(perms)} permutaciones generadas a partir de {len(seeds)} semillas.{RESET}")
+    chosen = sorted(perms, key=lambda x: (len(x), x))[:100000]
+    hits = run_dnsx_resolution(chosen, domain, resolvers, threads, "Permutaciones")
+    results.update(hits)
+
+    for tpl in DEFAULT_FUZZ_TEMPLATES:
+        cands = expand_fuzz_template(tpl, domain, words) - known - set(results)
+        hits = run_dnsx_resolution(cands, domain, resolvers, threads, f"Fuzzing")
+        results.update(hits)
+
+    print(f"\n{BOLD}{GREEN}[+] Pipeline completo: {len(results)} subdominios nuevos por enumeracion activa.{RESET}")
+    return {"passive": passive, "subcat": subcat_subs, "dns": dns_audit, "active": results}
+
+
+# --- Enumeracion centrada en WILDCARD DNS (pasiva y/o activa) ---
+
+def _random_label(n: int = 14) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+def find_cert_wildcard_zones(domain: str) -> Set[str]:
+    """Pasivo: zonas con certificado wildcard (*.zona) en crt.sh y CertSpotter."""
+    names: List[str] = []
+    try:
+        data = json.loads(fetch_url(f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json", timeout=15))
+        for e in data:
+            names += e.get("name_value", "").split("\n")
+    except Exception:
+        pass
+    try:
+        data = json.loads(fetch_url(f"https://api.certspotter.com/v1/issuances?domain={urllib.parse.quote(domain)}"
+                                    f"&include_subdomains=true&expand=dns_names", timeout=9))
+        for e in data:
+            names += e.get("dns_names", [])
+    except Exception:
+        pass
+    zones: Set[str] = set()
+    for n in names:
+        n = n.strip().lower().rstrip(".")
+        if n.startswith("*.") and (n[2:] == domain or n[2:].endswith("." + domain)):
+            zones.add(n[2:])
+    return zones
+
+
+def doh_wildcard_profile(zone: str) -> Tuple[Set[str], Set[str]]:
+    """Pasivo (DoH Cloudflare, sin tocar los NS del objetivo): IPs/CNAMEs a los que responde *.zona."""
+    ips: Set[str] = set()
+    cnames: Set[str] = set()
+    for _ in range(3):
+        for d in doh_query(f"{_random_label()}.{zone}", "A"):
+            (cnames if d.endswith(".") else ips).add(d.rstrip(".").lower())
+    return ips, cnames
+
+
+def run_wildcard_enum(domain: str, known: Set[str]) -> Dict:
+    """Busca wildcard DNS en el apex, en zonas con certificado wildcard y en las zonas padre
+    de los subdominios conocidos. Modo activo: ademas hace bruteforce DENTRO de cada zona
+    wildcard filtrando las respuestas identicas al wildcard."""
+    print(f"\n{MAGENTA}============================================================{RESET}")
+    print(f" {BOLD}ENUMERACION WILDCARD DNS ({domain}){RESET}")
+    print(f"{MAGENTA}============================================================{RESET}")
+    print(f" {BOLD}1.{RESET} Pasivo (certificados wildcard + sondeo via DoH Cloudflare)")
+    print(f" {BOLD}2.{RESET} {RED}Activo{RESET} (DNS directo + bruteforce dentro de cada zona wildcard)")
+    print(f" {BOLD}3.{RESET} Ambos")
+    mode = {"1": "pasivo", "2": "activo"}.get(input(f"\n{BOLD}Modo (1-3) [3]: {RESET}").strip(), "ambos")
+    report: Dict = {"mode": mode, "cert_zones": [], "wildcards": {}, "found": {}}
+
+    # zonas a sondear: apex + padres de subdominios conocidos (+ zonas de certificados)
+    zones = {domain} | {s.split(".", 1)[1] for s in known if s.count(".") > domain.count(".") + 1}
+
+    if mode in ("pasivo", "ambos"):
+        print(f"\n{YELLOW}[*] Buscando certificados wildcard (crt.sh, CertSpotter)...{RESET}")
+        cert_zones = find_cert_wildcard_zones(domain)
+        report["cert_zones"] = sorted(cert_zones)
+        zones |= cert_zones
+        for z in report["cert_zones"]:
+            print(f"  {YELLOW}[CERT]{RESET} *.{z}")
+        print(f"{CYAN}[i] {len(cert_zones)} zonas con certificado wildcard.{RESET}")
+
+    if mode == "pasivo":
+        print(f"\n{YELLOW}[*] Sondeando {len(zones)} zonas via DoH...{RESET}")
+        profile = doh_wildcard_profile
+    else:
+        print(f"\n{RED}[ AVISO ]{RESET} {RED}Modo activo: consultas DNS directas. Solo con autorizacion.{RESET}")
+        raw_res = input(f"{BOLD}Resolvers DNS (Enter = {', '.join(DEFAULT_RESOLVERS)}): {RESET}").strip()
+        resolvers = [r.strip() for r in raw_res.split(",") if r.strip()] or list(DEFAULT_RESOLVERS)
+        try:
+            resolvers = [str(ipaddress.IPv4Address(r)) for r in resolvers]
+        except ValueError:
+            print(f"{YELLOW}[i] Resolver invalido; se usan los de por defecto.{RESET}")
+            resolvers = list(DEFAULT_RESOLVERS)
+        detector = WildcardDetector(resolvers)
+        print(f"\n{YELLOW}[*] Sondeando {len(zones)} zonas con DNS directo...{RESET}")
+        profile = detector.profile
+
+    for z in sorted(zones):
+        ips, cnames = profile(z)
+        if ips or cnames:
+            report["wildcards"][z] = {"ips": sorted(ips), "cnames": sorted(cnames)}
+            print(f"  {RED}[WILDCARD]{RESET} {BOLD}*.{z}{RESET} -> {', '.join(sorted(cnames | ips))}")
+    if not report["wildcards"]:
+        print(f"{GREEN}[i] Ninguna zona responde a nombres aleatorios: sin wildcard DNS activo.{RESET}")
+
+    if mode != "pasivo":
+        targets = set(report["wildcards"]) or {domain}
+        words = list(dict.fromkeys(BUILTIN_WORDLIST))
+        path = input(f"{BOLD}Diccionario propio (Enter = integrado, {len(words)} palabras): {RESET}").strip()
+        if path:
+            words = load_wordlist(path) or words
+        threads = _ask_int("Hilos concurrentes", 100, 1, 500)
+        cands: Set[str] = set()
+        for z in targets:
+            cands |= dictionary_candidates(z, words)
+        # el detector filtra por zona padre, asi que solo sobreviven los registros reales
+        report["found"] = run_dnsx_resolution(cands - known, domain, resolvers, threads, "Wildcard")
+    return report
+
+
+# --- Escaneo de puertos TCP (dominio y subdominios) ---
+
+TOP_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 465, 587, 993, 995, 1433, 1521, 2049,
+    2082, 2083, 2086, 2087, 3000, 3306, 3389, 5000, 5432, 5900, 6379, 8000, 8008, 8080, 8081, 8443,
+    8888, 9000, 9090, 9200, 9443, 10000, 27017,
+]
+
+
+def parse_ports(spec: str) -> List[int]:
+    """'top' | 'full' | '22,80,443,8000-8100'. Lanza ValueError si es invalido."""
+    spec = spec.strip().lower()
+    if spec in ("full", "all", "completo"):
+        return list(range(1, 65536))
+    if spec in ("", "top"):
+        return list(TOP_PORTS)
+    ports: Set[int] = set()
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        if "-" in part:
+            a, b = sorted(int(x) for x in part.split("-", 1))
+            ports.update(range(a, b + 1))
+        else:
+            ports.add(int(part))
+    if not ports or min(ports) < 1 or max(ports) > 65535:
+        raise ValueError(f"puertos fuera de rango 1-65535: {spec}")
+    return sorted(ports)
+
+
+def scan_ports(ip: str, ports: List[int], timeout: float = 0.7, threads: int = 400) -> List[int]:
+    """TCP connect scan (no requiere root)."""
+    def probe(port: int):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return port if s.connect_ex((ip, port)) == 0 else None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(threads, len(ports))) as ex:
+        return sorted(p for p in ex.map(probe, ports) if p)
+
+
+def _svc_name(port: int) -> str:
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "?"
+
+
+def ports_to_nmap(ports: List[int]) -> str:
+    """[22, 80, 81, 82] -> '22,80-82' (evita lineas de comando gigantes)."""
+    out: List[str] = []
+    start = prev = None
+    for p in sorted(set(ports)):
+        if prev is not None and p == prev + 1:
+            prev = p
+            continue
+        if start is not None:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = p
+    if start is not None:
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(out)
+
+
+def parse_nmap_xml(xml_text: str) -> Dict[int, str]:
+    """Puertos abiertos de la salida -oX de nmap -> {puerto: 'servicio producto version'}."""
+    services: Dict[int, str] = {}
+    for port in ET.fromstring(xml_text).iter("port"):
+        state = port.find("state")
+        if state is None or state.get("state") != "open":
+            continue
+        svc = port.find("service")
+        if svc is None:
+            desc = "?"
+        else:
+            desc = " ".join(filter(None, (svc.get("name"), svc.get("product"),
+                                          svc.get("version"), svc.get("extrainfo")))) or "?"
+        services[int(port.get("portid"))] = desc
+    return services
+
+
+def nmap_scan(ip: str, ports: List[int], version: bool = True) -> Optional[Dict[int, str]]:
+    """Escanea con nmap. Devuelve {puerto: servicio} o None si nmap falla (para hacer fallback)."""
+    is_root = getattr(os, "geteuid", lambda: 1)() == 0
+    cmd = ["nmap", "-sS" if is_root else "-sT", "-Pn", "-n", "--open", "-T4",
+           "-p", ports_to_nmap(ports), "-oX", "-", ip]
+    if version:
+        cmd.insert(1, "-sV")
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        print(f"{RED}[-] No se pudo ejecutar nmap: {e}{RESET}")
+        return None
+    if out.returncode != 0:
+        print(f"{RED}[-] nmap devolvio codigo {out.returncode}: {(out.stderr or '').strip()[:300]}{RESET}")
+        return None
+    try:
+        return parse_nmap_xml(out.stdout)
+    except ET.ParseError as e:
+        print(f"{RED}[-] Salida XML de nmap no valida: {e}{RESET}")
+        return None
+
+
+def run_port_scan(domain: str, known: Set[str]) -> Dict[str, Dict]:
+    """Menu de escaneo de puertos. Agrupa por IP para no escanear dos veces la misma maquina."""
+    print(f"\n{MAGENTA}============================================================{RESET}")
+    print(f" {BOLD}ESCANEO DE PUERTOS TCP ({domain}){RESET}")
+    print(f"{MAGENTA}============================================================{RESET}")
+    print(f"{RED}[ AVISO ]{RESET} {RED}Escaneo ACTIVO contra los hosts. Solo con autorizacion expresa.{RESET}")
+    print(f"\n {BOLD}1.{RESET} Solo {domain}")
+    print(f" {BOLD}2.{RESET} {domain} + {len(known)} subdominios descubiertos")
+    print(f" {BOLD}3.{RESET} Lista manual de hosts")
+    scope = input(f"\n{BOLD}Objetivos (1-3) [1]: {RESET}").strip()
+    if scope == "2":
+        targets = [domain] + sorted(known)
+    elif scope == "3":
+        targets = [clean_domain(t) for t in input(f"{BOLD}Hosts separados por comas: {RESET}").split(",")]
+    else:
+        targets = [domain]
+
+    while True:
+        spec = input(f"{BOLD}Puertos: top ({len(TOP_PORTS)}) | full (1-65535) | lista 22,80,8000-8100 [top]: {RESET}")
+        try:
+            ports = parse_ports(spec)
+            break
+        except ValueError as e:
+            print(f"{RED}[!] {e}{RESET}")
+
+    use_nmap = shutil.which("nmap") is not None
+    version = False
+    threads = 400
+    if use_nmap:
+        print(f"{GREEN}[i] Motor: nmap ({shutil.which('nmap')}){RESET}")
+        version = input(f"{BOLD}¿Deteccion de versiones de servicio (-sV, mas lento)? (s/n) [s]: {RESET}"
+                        ).strip().lower() in ["", "s", "si", "y", "yes"]
+    else:
+        print(f"{YELLOW}[i] nmap no esta en el PATH; se usara el escaner TCP interno (sockets).{RESET}")
+        print(f"{YELLOW}    Instalacion: https://nmap.org/download  |  apt install nmap{RESET}")
+        threads = _ask_int("Hilos por host", 400, 1, 2000)
+
+    by_ip: Dict[str, List[str]] = {}
+    for host in dict.fromkeys(t for t in targets if t):
+        try:
+            ips = [str(ipaddress.IPv4Address(host))]  # ya es una IP (solo IPv4: el escaner usa AF_INET)
+        except ValueError:
+            status, ips, _ = dns_resolve(host, DEFAULT_RESOLVERS)
+            ips = ips if status == "ok" else []
+        if not ips:
+            print(f"  {YELLOW}[-] {host} no resuelve a IPv4, se omite{RESET}")
+        for ip in ips:
+            by_ip.setdefault(ip, []).append(host)
+
+    est = "" if use_nmap else f" (peor caso ~{len(by_ip) * len(ports) / threads * 0.7:.0f}s)"
+    print(f"\n{YELLOW}[*] {len(by_ip)} IPs unicas x {len(ports)} puertos{est}. "
+          f"Ctrl+C para parar y conservar lo escaneado.{RESET}")
+    results: Dict[str, Dict] = {}
+    try:
+        for ip, hosts in by_ip.items():
+            print(f"\n{CYAN}[*] {ip}{RESET} ({', '.join(hosts[:3])}{' ...' if len(hosts) > 3 else ''})")
+            engine = "nmap"
+            services = nmap_scan(ip, ports, version) if use_nmap else None
+            if services is None:
+                if use_nmap:
+                    print(f"{YELLOW}[i] Fallback al escaner interno para {ip}.{RESET}")
+                engine = "sockets"
+                services = {p: _svc_name(p) for p in scan_ports(ip, ports, threads=threads)}
+            open_ports = sorted(services)
+            results[ip] = {"hosts": hosts, "open": open_ports, "services": services, "engine": engine}
+            for p in open_ports:
+                print(f"  {GREEN}[OPEN]{RESET} {ip}:{p}  {services[p]}")
+            if not open_ports:
+                print(f"  {YELLOW}(sin puertos abiertos en el rango){RESET}")
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}[!] Interrumpido; se conservan los resultados parciales.{RESET}")
+    print(f"\n{CYAN}[OK] Escaneo de puertos: {sum(len(r['open']) for r in results.values())} "
+          f"puertos abiertos en {len(results)} IPs{RESET}")
+    return results
+
+
+def _selftest():
+    assert parse_ports("22,80,8000-8002") == [22, 80, 8000, 8001, 8002]
+    assert parse_ports("10-8") == [8, 9, 10] and parse_ports("") == TOP_PORTS
+    assert len(parse_ports("full")) == 65535
+    for bad in ("0", "70000", ",", "abc"):
+        try:
+            parse_ports(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    port = srv.getsockname()[1]
+    assert scan_ports("127.0.0.1", [port, 1], timeout=0.5) == [port]
+    assert ports_to_nmap([80, 22, 81, 82, 443]) == "22,80-82,443" and ports_to_nmap(TOP_PORTS[:3]) == "21-23"
+    xml = ('<nmaprun><host><ports><port protocol="tcp" portid="22"><state state="open"/>'
+           '<service name="ssh" product="OpenSSH" version="9.6"/></port>'
+           '<port protocol="tcp" portid="81"><state state="closed"/></port></ports></host></nmaprun>')
+    assert parse_nmap_xml(xml) == {22: "ssh OpenSSH 9.6"}
+    assert filter_by_keywords({"www.digital.com", "git.digital.com"}, ["git"], "digital.com") == [("git.digital.com", "git")]
+    assert not is_valid_host("..\\..\\x.com") and is_valid_host("stats.wnba.com")
+    if shutil.which("nmap"):
+        assert port in (nmap_scan("127.0.0.1", [port, 1], version=False) or {}), "nmap no vio el puerto"
+        print(f"{GREEN}nmap real OK{RESET}")
+    srv.close()
+    print(f"{GREEN}selftest OK{RESET}")
+
+
+def filter_by_keywords(subdomains: Set[str], keywords: List[str], domain: str = "") -> List[Tuple[str, str]]:
     """Encuentra subdominios que contienen indicios de logins/paneles y su etiqueta."""
     matches = []
     for sub in sorted(subdomains):
         prefix = sub.split(".")[0]
         full_sub = sub.lower()
+        # sin el dominio raiz: si no, 'digital.com' casaria 'git' en todos sus subdominios
+        if domain and full_sub.endswith("." + domain):
+            full_sub = full_sub[:-len(domain) - 1]
         matched_kw = None
         for kw in keywords:
             if kw in prefix:
@@ -961,15 +1383,30 @@ def filter_by_keywords(subdomains: Set[str], keywords: List[str]) -> List[Tuple[
 
 
 def save_results(domain: str, matches: List[Tuple[str, str]], all_subs: Set[str], dns_info: Dict = None,
-                 active_results: Dict = None):
+                 active_results: Dict = None, subcat_subs: Set[str] = None,
+                 wildcard_info: Dict = None, port_results: Dict = None):
     """Exporta el reporte consolidado a archivo de texto."""
     filename = f"{domain}_subcat_report.txt"
     try:
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"============================================================\n")
-            f.write(f"   SUBCAT PASSIVE RECON & DEEP DIG REPORT: {domain}\n")
+            f.write(f"   SUBCAT PASSIVE + ACTIVE RECON REPORT: {domain}\n")
             f.write(f"   Auditor: {get_current_user()} | Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"============================================================\n\n")
+
+            if RUN_STATS:
+                f.write("[+] RESUMEN DE EJECUCION (validacion de tecnicas):\n")
+                for st in RUN_STATS:
+                    f.write(f"  - {st['label']:<30} motor: {st['engine']:<17} "
+                            f"candidatos: {st['total']:<7} hallazgos: {st['hits']:<5} "
+                            f"filtrados wildcard: {st['filtered']:<5} tiempo: {st['secs']}s\n")
+                f.write("\n")
+
+            if subcat_subs is not None:
+                f.write(f"[+] SUBCAT (herramienta externa) - SUBDOMINIOS ({len(subcat_subs)}):\n")
+                for sub in sorted(subcat_subs):
+                    f.write(f"  - {sub}\n")
+                f.write("\n")
 
             if dns_info:
                 f.write(f"[+] AUDITORIA DNS PROFUNDA (DoH):\n")
@@ -984,12 +1421,37 @@ def save_results(domain: str, matches: List[Tuple[str, str]], all_subs: Set[str]
             for sub, tag in matches:
                 f.write(f"  - {sub}  (tag: {tag})\n")
 
-            if active_results:
+            if active_results is not None:
                 f.write(f"\n[+] ENUMERACION ACTIVA - SUBDOMINIOS NUEVOS ({len(active_results)}):\n")
-                for host, info in sorted(active_results.items()):
-                    ip_s = ", ".join(info["ips"]) or "-"
-                    cn_s = ", ".join(info["cnames"]) or "-"
-                    f.write(f"  - {host}  IP: {ip_s}  CNAME: {cn_s}\n")
+                if not active_results:
+                    f.write("  (Ejecutada, sin hallazgos nuevos respecto al escaneo pasivo)\n")
+                for tech in ("Diccionario", "Permutaciones", "Fuzzing", "Wildcard"):
+                    group = {h: i for h, i in active_results.items() if i.get("source") == tech}
+                    if not group:
+                        continue
+                    f.write(f"\n  --- {tech} ({len(group)}) ---\n")
+                    for host, info in sorted(group.items()):
+                        ip_s = ", ".join(info["ips"]) or "-"
+                        cn_s = ", ".join(info["cnames"]) or "-"
+                        f.write(f"  - {host}  IP: {ip_s}  CNAME: {cn_s}\n")
+
+            if wildcard_info is not None:
+                f.write(f"\n[+] WILDCARD DNS (modo {wildcard_info['mode']}):\n")
+                for z in wildcard_info["cert_zones"]:
+                    f.write(f"  - certificado: *.{z}\n")
+                for z, w in sorted(wildcard_info["wildcards"].items()):
+                    f.write(f"  - activo: *.{z} -> {', '.join(w['cnames'] + w['ips'])}\n")
+                if not wildcard_info["cert_zones"] and not wildcard_info["wildcards"]:
+                    f.write("  (Sin wildcard detectado)\n")
+
+            if port_results is not None:
+                f.write(f"\n[+] ESCANEO DE PUERTOS ({len(port_results)} IPs):\n")
+                for ip, r in sorted(port_results.items()):
+                    f.write(f"  - {ip} ({', '.join(r['hosts'])}) [motor: {r['engine']}]\n")
+                    for p in r["open"]:
+                        f.write(f"       {p}/tcp  {r['services'][p]}\n")
+                    if not r["open"]:
+                        f.write("       (sin puertos abiertos)\n")
 
             f.write(f"\n[+] TODOS LOS SUBDOMINIOS DESCUBIERTOS ({len(all_subs)}):\n")
             for s in sorted(all_subs):
@@ -1012,7 +1474,7 @@ def main():
     raw_domain = input(f"{BOLD}Introduce el dominio a analizar (ej: stats.wnba.com o ejemplo.com): {RESET}")
     domain = clean_domain(raw_domain)
 
-    if not domain or "." not in domain:
+    if not domain or "." not in domain or not is_valid_host(domain):
         print(f"{RED}[!] Dominio no valido. Saliendo.{RESET}")
         sys.exit(1)
 
@@ -1034,7 +1496,11 @@ def main():
     all_discovered: Set[str] = set()
     candidate_logins: List[Tuple[str, str]] = []
     dns_audit: Dict = {}
-    active_results: Dict = {}
+    subcat_found = None
+    auto_saved = False
+    active_results = None  # None = no ejecutada; {} = ejecutada sin hallazgos
+    wildcard_info = None
+    port_results = None
 
     # Menu interactivo por pasos
     while True:
@@ -1046,30 +1512,33 @@ def main():
         print(f" {BOLD}5.{RESET} Ver / Añadir palabras clave de filtrado")
         print(f" {BOLD}6.{RESET} {RED}Enumeracion ACTIVA{RESET} (Diccionario + Permutaciones + Fuzzing)")
         print(f" {BOLD}7.{RESET} Salir")
+        print(f" {BOLD}8.{RESET} {RED}PIPELINE COMPLETO{RESET} (subcat + pasivo + Dig + activa + informe automatico)")
+        print(f" {BOLD}9.{RESET} {YELLOW}Enumeracion WILDCARD{RESET} (pasiva o activa: certificados *., sondeo y bruteforce filtrado)")
+        print(f" {BOLD}10.{RESET} {RED}Escaneo de PUERTOS{RESET} (top / completo / especifico, dominio y subdominios)")
 
-        opcion = input(f"\n{BOLD}Selecciona una opcion (1-7): {RESET}").strip()
+        opcion = input(f"\n{BOLD}Selecciona una opcion (1-10): {RESET}").strip()
 
         if opcion == "1":
             all_discovered = run_parallel_scan(target_domain)
-            candidate_logins = filter_by_keywords(all_discovered, keywords)
+            candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
             break
         elif opcion == "2":
             dns_audit = run_deep_dig(target_domain)
             cont = input(f"\n{BOLD}¿Deseas buscar tambien subdominios y logins ahora? (s/n): {RESET}").strip().lower()
             if cont in ["s", "si", "y", "yes"]:
                 all_discovered = run_parallel_scan(target_domain)
-                candidate_logins = filter_by_keywords(all_discovered, keywords)
+                candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
             break
         elif opcion == "3":
             dns_audit = run_deep_dig(target_domain)
             all_discovered = run_parallel_scan(target_domain)
-            candidate_logins = filter_by_keywords(all_discovered, keywords)
+            candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
             break
         elif opcion == "4":
             if not candidate_logins:
                 print(f"\n{YELLOW}[i] Ejecutando primero busqueda pasiva para obtener candidatos...{RESET}")
                 all_discovered = run_parallel_scan(target_domain)
-                candidate_logins = filter_by_keywords(all_discovered, keywords)
+                candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
             resolve_candidate_logins(candidate_logins)
             continue
         elif opcion == "5":
@@ -1089,13 +1558,43 @@ def main():
                     all_discovered = run_parallel_scan(target_domain)
             active_results = run_active_enum(target_domain, all_discovered)
             all_discovered = set(all_discovered) | set(active_results)
-            candidate_logins = filter_by_keywords(all_discovered, keywords)
+            candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
             break
         elif opcion == "7":
+            if all_discovered or dns_audit or wildcard_info is not None or port_results is not None:
+                break  # hay resultados sin guardar: pasar por la exportacion
             print(f"{YELLOW}Operacion finalizada.{RESET}")
             sys.exit(0)
+        elif opcion == "8":
+            full = run_full_pipeline(target_domain)
+            if not full:
+                continue
+            dns_audit = full["dns"]
+            subcat_found = full["subcat"]
+            active_results = full["active"]
+            all_discovered = set(full["passive"]) | subcat_found | set(active_results)
+            candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
+            save_results(target_domain, candidate_logins, all_discovered, dns_audit,
+                         active_results, subcat_found)
+            auto_saved = True
+            break
+        elif opcion == "9":
+            wildcard_info = run_wildcard_enum(target_domain, all_discovered)
+            if wildcard_info["found"]:
+                active_results = {**(active_results or {}), **wildcard_info["found"]}
+                all_discovered = set(all_discovered) | set(wildcard_info["found"])
+                candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
+            continue
+        elif opcion == "10":
+            if not all_discovered:
+                pre = input(f"\n{BOLD}¿Ejecutar antes el escaneo pasivo para tener subdominios? (s/n) [s]: {RESET}").strip().lower()
+                if pre in ["", "s", "si", "y", "yes"]:
+                    all_discovered = run_parallel_scan(target_domain)
+                    candidate_logins = filter_by_keywords(all_discovered, keywords, target_domain)
+            port_results = run_port_scan(target_domain, all_discovered)
+            break
         else:
-            print(f"{RED}[!] Opcion invalida. Elige un numero del 1 al 7.{RESET}")
+            print(f"{RED}[!] Opcion invalida. Elige un numero del 1 al 10.{RESET}")
 
     # Mostrar resultados de logins
     if all_discovered:
@@ -1116,10 +1615,16 @@ def main():
 
     # Ofrecer exportacion
     print("\n" + "-" * 64)
+    if auto_saved:
+        return
     guardar = input(f"{BOLD}¿Deseas exportar el reporte consolidado a un archivo? (s/n): {RESET}").strip().lower()
     if guardar in ["s", "si", "y", "yes"]:
-        save_results(target_domain, candidate_logins, all_discovered, dns_audit, active_results)
+        save_results(target_domain, candidate_logins, all_discovered, dns_audit, active_results, subcat_found,
+                     wildcard_info, port_results)
 
 
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        main()
